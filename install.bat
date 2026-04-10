@@ -21,7 +21,7 @@ if exist "Parmana-2.0" (
     cd Parmana-2.0
     git pull
 ) else (
-    git clone https://github.com/EleshVaishnav/Test-claude-parmana.git
+    git clone https://github.com/EleshVaishnav/TP.git
     cd Parmana-2.0
 )
 
