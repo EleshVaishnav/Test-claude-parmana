@@ -20,7 +20,7 @@ if [ -d "Parmana-2.0" ]; then
   echo "▸ Directory exists — pulling latest..."
   cd Parmana-2.0 && git pull
 else
-  git clone https://github.com/yourusername/Parmana-2.0.git
+  git clone https://github.com/EleshVaishnav/Test-claude-parmana.git
   cd Parmana-2.0
 fi
 
