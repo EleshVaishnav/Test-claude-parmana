@@ -1,0 +1,486 @@
+# ╔══════════════════════════════════════════════════════════════════╗
+# ║           PARMANA 2.0 — Vision Handler                          ║
+# ║  Image analysis routed to vision-capable providers.             ║
+# ║  Tesseract OCR fallback for providers without vision support.   ║
+# ╚══════════════════════════════════════════════════════════════════╝
+
+from __future__ import annotations
+
+import base64
+import io
+import logging
+import os
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional, Union
+from urllib.request import urlopen
+
+import yaml
+
+logger = logging.getLogger(__name__)
+
+
+# ── Config ────────────────────────────────────────────────────────────────────
+
+def _load_cfg() -> dict:
+    try:
+        with open("config.yaml") as f:
+            return yaml.safe_load(f).get("vision", {})
+    except Exception:
+        return {}
+
+_cfg = _load_cfg()
+_ENABLED           = _cfg.get("enabled", True)
+_PREFERRED_PROVIDER = _cfg.get("preferred_provider", "openai")
+_PREFERRED_MODEL    = _cfg.get("preferred_model", "gpt-4o")
+_OCR_FALLBACK       = _cfg.get("ocr_fallback", "tesseract")
+_MAX_SIZE_MB        = _cfg.get("max_image_size_mb", 20)
+
+# Vision-capable providers (subset of all providers)
+_VISION_PROVIDERS = {
+    "openai",
+    "anthropic",
+    "gemini",
+    "groq",
+    "openrouter",
+    "mistral",
+    "deepseek",
+    "xai",
+    "fireworks",
+    "dashscope",
+    "byteplus",
+    "moonshot",
+    "zhipuai",
+    "venice",
+}
+
+
+# ── Result Schema ─────────────────────────────────────────────────────────────
+
+@dataclass
+class VisionResult:
+    text: str                          # extracted text / analysis
+    provider: str
+    model: str
+    method: str                        # "vision_api" | "ocr"
+    latency_ms: float = 0.0
+    image_size_bytes: int = 0
+
+
+# ── Image Utilities ───────────────────────────────────────────────────────────
+
+def _load_image_bytes(source: Union[str, Path, bytes]) -> bytes:
+    """
+    Load image from:
+    - bytes       → returned as-is
+    - file path   → read from disk
+    - http(s) URL → fetched
+    - base64 str  → decoded
+    """
+    if isinstance(source, bytes):
+        return source
+
+    if isinstance(source, Path) or (isinstance(source, str) and os.path.exists(source)):
+        return Path(source).read_bytes()
+
+    if isinstance(source, str):
+        if source.startswith(("http://", "https://")):
+            with urlopen(source, timeout=15) as resp:
+                return resp.read()
+        # Try base64
+        try:
+            return base64.b64decode(source)
+        except Exception:
+            pass
+
+    raise ValueError(f"Cannot load image from: {type(source)}")
+
+
+def _to_base64(image_bytes: bytes) -> str:
+    return base64.b64encode(image_bytes).decode("utf-8")
+
+
+def _detect_mime(image_bytes: bytes) -> str:
+    """Detect image MIME type from magic bytes."""
+    if image_bytes[:8] == b'\x89PNG\r\n\x1a\n':
+        return "image/png"
+    if image_bytes[:3] == b'\xff\xd8\xff':
+        return "image/jpeg"
+    if image_bytes[:4] == b'GIF8':
+        return "image/gif"
+    if image_bytes[:4] == b'RIFF' and image_bytes[8:12] == b'WEBP':
+        return "image/webp"
+    return "image/jpeg"  # safe fallback
+
+
+def _resize_if_needed(image_bytes: bytes) -> bytes:
+    """Resize image if over max size limit."""
+    max_bytes = _MAX_SIZE_MB * 1024 * 1024
+    if len(image_bytes) <= max_bytes:
+        return image_bytes
+
+    try:
+        from PIL import Image
+
+        img = Image.open(io.BytesIO(image_bytes))
+        # Scale down proportionally until under limit
+        scale = (max_bytes / len(image_bytes)) ** 0.5
+        new_w = int(img.width * scale)
+        new_h = int(img.height * scale)
+        img = img.resize((new_w, new_h), Image.LANCZOS)
+
+        buf = io.BytesIO()
+        fmt = img.format or "JPEG"
+        img.save(buf, format=fmt, quality=85)
+        resized = buf.getvalue()
+        logger.debug(
+            f"Image resized: {len(image_bytes)//1024}KB → {len(resized)//1024}KB"
+        )
+        return resized
+    except ImportError:
+        logger.warning("Pillow not installed — sending oversized image as-is.")
+        return image_bytes
+
+
+# ── OCR Fallback ──────────────────────────────────────────────────────────────
+
+def _ocr_tesseract(image_bytes: bytes) -> str:
+    """Extract text via Tesseract OCR."""
+    try:
+        import pytesseract
+        from PIL import Image
+
+        tesseract_cmd = os.getenv("TESSERACT_CMD", "")
+        if tesseract_cmd:
+            pytesseract.pytesseract.tesseract_cmd = tesseract_cmd
+
+        img = Image.open(io.BytesIO(image_bytes))
+        text = pytesseract.image_to_string(img)
+        return text.strip() or "(no text detected by OCR)"
+    except ImportError:
+        return "Error: pytesseract/Pillow not installed for OCR fallback."
+    except Exception as e:
+        return f"OCR error: {e}"
+
+
+# ── Provider Vision Calls ─────────────────────────────────────────────────────
+
+async def _vision_openai(
+    image_b64: str,
+    mime_type: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+    base_url: Optional[str] = None,
+) -> str:
+    from openai import AsyncOpenAI
+
+    client = AsyncOpenAI(
+        api_key=api_key,
+        base_url=base_url or "https://api.openai.com/v1",
+    )
+    resp = await client.chat.completions.create(
+        model=model,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+                },
+                {"type": "text", "text": prompt},
+            ],
+        }],
+        max_tokens=2048,
+    )
+    return resp.choices[0].message.content
+
+
+async def _vision_anthropic(
+    image_b64: str,
+    mime_type: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+) -> str:
+    import anthropic
+
+    client = anthropic.AsyncAnthropic(api_key=api_key)
+    resp = await client.messages.create(
+        model=model,
+        max_tokens=2048,
+        messages=[{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": mime_type,
+                        "data": image_b64,
+                    },
+                },
+                {"type": "text", "text": prompt},
+            ],
+        }],
+    )
+    return resp.content[0].text
+
+
+async def _vision_gemini(
+    image_bytes: bytes,
+    mime_type: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+) -> str:
+    import asyncio
+    import google.generativeai as genai
+    from google.generativeai.types import BlobDict
+
+    genai.configure(api_key=api_key)
+    gmodel = genai.GenerativeModel(model)
+    image_part = {"mime_type": mime_type, "data": image_bytes}
+    resp = await asyncio.to_thread(gmodel.generate_content, [image_part, prompt])
+    return resp.text
+
+
+async def _vision_openai_compat(
+    image_b64: str,
+    mime_type: str,
+    prompt: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+) -> str:
+    """Generic OpenAI-compatible vision call (OpenRouter, Fireworks, xAI, etc.)"""
+    import httpx
+
+    payload = {
+        "model": model,
+        "messages": [{
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime_type};base64,{image_b64}"},
+                },
+                {"type": "text", "text": prompt},
+            ],
+        }],
+        "max_tokens": 2048,
+    }
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+    async with httpx.AsyncClient(timeout=60) as client:
+        resp = await client.post(
+            f"{base_url.rstrip('/')}/chat/completions",
+            headers=headers,
+            json=payload,
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+
+# ── Vision Handler ────────────────────────────────────────────────────────────
+
+class VisionHandler:
+    """
+    Routes image analysis to the best available vision-capable provider.
+    Falls back to Tesseract OCR if no vision provider is available.
+
+    Usage:
+        vh = VisionHandler()
+        result = await vh.analyze(
+            image="path/to/image.png",
+            prompt="What is shown in this diagram?",
+        )
+        print(result.text)
+    """
+
+    def __init__(
+        self,
+        preferred_provider: str = _PREFERRED_PROVIDER,
+        preferred_model: str = _PREFERRED_MODEL,
+    ):
+        self._provider = preferred_provider
+        self._model = preferred_model
+
+    async def analyze(
+        self,
+        image: Union[str, Path, bytes],
+        prompt: str = "Describe this image in detail.",
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> VisionResult:
+        """
+        Analyze an image with a text prompt.
+
+        Args:
+            image:    File path, URL, bytes, or base64 string.
+            prompt:   What to ask about the image.
+            provider: Override preferred provider.
+            model:    Override preferred model.
+
+        Returns:
+            VisionResult with .text containing the analysis.
+        """
+        if not _ENABLED:
+            return VisionResult(
+                text="Vision is disabled in config.",
+                provider="none", model="none", method="disabled",
+            )
+
+        t0 = time.monotonic()
+
+        # Load + prepare image
+        try:
+            image_bytes = _load_image_bytes(image)
+        except Exception as e:
+            return VisionResult(
+                text=f"Failed to load image: {e}",
+                provider="none", model="none", method="error",
+            )
+
+        image_bytes = _resize_if_needed(image_bytes)
+        mime_type = _detect_mime(image_bytes)
+        image_b64 = _to_base64(image_bytes)
+
+        active_provider = provider or self._provider
+        active_model = model or self._model
+
+        # Try vision API
+        if active_provider in _VISION_PROVIDERS:
+            try:
+                text = await self._call_vision_api(
+                    provider=active_provider,
+                    model=active_model,
+                    image_bytes=image_bytes,
+                    image_b64=image_b64,
+                    mime_type=mime_type,
+                    prompt=prompt,
+                )
+                return VisionResult(
+                    text=text,
+                    provider=active_provider,
+                    model=active_model,
+                    method="vision_api",
+                    latency_ms=(time.monotonic() - t0) * 1000,
+                    image_size_bytes=len(image_bytes),
+                )
+            except Exception as e:
+                logger.warning(
+                    f"Vision API failed ({active_provider}/{active_model}): {e} "
+                    f"— falling back to OCR"
+                )
+
+        # OCR fallback
+        logger.debug(f"Using OCR fallback ({_OCR_FALLBACK})")
+        ocr_text = _ocr_tesseract(image_bytes)
+        return VisionResult(
+            text=ocr_text,
+            provider="tesseract",
+            model="ocr",
+            method="ocr",
+            latency_ms=(time.monotonic() - t0) * 1000,
+            image_size_bytes=len(image_bytes),
+        )
+
+    async def _call_vision_api(
+        self,
+        provider: str,
+        model: str,
+        image_bytes: bytes,
+        image_b64: str,
+        mime_type: str,
+        prompt: str,
+    ) -> str:
+        if provider == "openai":
+            return await _vision_openai(
+                image_b64=image_b64,
+                mime_type=mime_type,
+                prompt=prompt,
+                model=model,
+                api_key=os.getenv("OPENAI_API_KEY", ""),
+                base_url=os.getenv("OPENAI_BASE_URL", ""),
+            )
+
+        elif provider == "anthropic":
+            return await _vision_anthropic(
+                image_b64=image_b64,
+                mime_type=mime_type,
+                prompt=prompt,
+                model=model,
+                api_key=os.getenv("ANTHROPIC_API_KEY", ""),
+            )
+
+        elif provider == "gemini":
+            return await _vision_gemini(
+                image_bytes=image_bytes,
+                mime_type=mime_type,
+                prompt=prompt,
+                model=model,
+                api_key=os.getenv("GEMINI_API_KEY", ""),
+            )
+
+        else:
+            # OpenAI-compatible providers (OpenRouter, xAI, Fireworks, etc.)
+            provider_base_urls = {
+                "openrouter": os.getenv("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+                "xai":        os.getenv("XAI_BASE_URL", "https://api.x.ai/v1"),
+                "fireworks":  os.getenv("FIREWORKS_BASE_URL", "https://api.fireworks.ai/inference/v1"),
+                "dashscope":  os.getenv("DASHSCOPE_BASE_URL", "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"),
+                "byteplus":   os.getenv("BYTEPLUS_BASE_URL", "https://ark.ap-southeast.bytepluses.com/api/v3"),
+                "moonshot":   os.getenv("MOONSHOT_BASE_URL", "https://api.moonshot.cn/v1"),
+                "venice":     os.getenv("VENICE_BASE_URL", "https://api.venice.ai/api/v1"),
+                "groq":       "https://api.groq.com/openai/v1",
+                "mistral":    "https://api.mistral.ai/v1",
+                "zhipuai":    "https://open.bigmodel.cn/api/paas/v4",
+            }
+            provider_api_key_envs = {
+                "openrouter": "OPENROUTER_API_KEY",
+                "xai":        "XAI_API_KEY",
+                "fireworks":  "FIREWORKS_API_KEY",
+                "dashscope":  "DASHSCOPE_API_KEY",
+                "byteplus":   "BYTEPLUS_API_KEY",
+                "moonshot":   "MOONSHOT_API_KEY",
+                "venice":     "VENICE_API_KEY",
+                "groq":       "GROQ_API_KEY",
+                "mistral":    "MISTRAL_API_KEY",
+                "zhipuai":    "ZHIPUAI_API_KEY",
+            }
+            base_url = provider_base_urls.get(provider, "")
+            api_key  = os.getenv(provider_api_key_envs.get(provider, ""), "")
+            if not base_url:
+                raise ValueError(f"No base_url configured for vision provider '{provider}'")
+            return await _vision_openai_compat(
+                image_b64=image_b64,
+                mime_type=mime_type,
+                prompt=prompt,
+                model=model,
+                api_key=api_key,
+                base_url=base_url,
+            )
+
+    async def ocr(self, image: Union[str, Path, bytes]) -> VisionResult:
+        """Extract text only via OCR. Skips vision API entirely."""
+        t0 = time.monotonic()
+        image_bytes = _load_image_bytes(image)
+        text = _ocr_tesseract(image_bytes)
+        return VisionResult(
+            text=text,
+            provider="tesseract",
+            model="ocr",
+            method="ocr",
+            latency_ms=(time.monotonic() - t0) * 1000,
+            image_size_bytes=len(image_bytes),
+        )
+
+    def __repr__(self) -> str:
+        return (
+            f"<VisionHandler provider={self._provider} "
+            f"model={self._model} enabled={_ENABLED}>"
+        )
